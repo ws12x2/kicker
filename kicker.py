@@ -47,14 +47,57 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
+    FSInputFile,
 )
 from aiogram.exceptions import TelegramBadRequest
+try:
+    from aiogram.exceptions import TelegramMigrateToChat
+except ImportError:
+    class TelegramMigrateToChat(Exception):
+        """aiogram versiyasida bu klass topilmasa, hech qachon ushlanmaydigan bo'sh o'rinbosar."""
+        migrate_to_chat_id = None
 
 # ==================== SOZLAMALAR ====================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "6011700872:AAFwlE59GqI04UeHgWkBnl5RwExjKI5RSl0")
 DB_PATH = os.getenv("DB_PATH", "kicker.db")
+
+# BOT EGASI (owner) - bu botning umumiy /admin paneliga (baza zaxirasi va
+# tiklash) kirish huquqiga ega bo'lgan shaxs(lar). Bu botning har bir
+# foydalanuvchisi o'z kanalini ulab, o'sha kanal uchun "admin" bo'lishi
+# mumkin (added_by orqali) - lekin BAZANI BOSHQARISH faqat OWNER_IDS
+# ro'yxatidagilar uchun.
+# Sozlash: Render "Environment" bo'limida OWNER_IDS="123456789,987654321"
+# kabi (vergul bilan ajratib, bir nechta bo'lishi mumkin) yozing, yoki
+# pastdagi ro'yxatga to'g'ridan-to'g'ri o'z Telegram ID'ingizni yozing.
+_owner_ids_raw = os.getenv("OWNER_IDS", "").strip()
+OWNER_IDS = [int(x.strip()) for x in _owner_ids_raw.split(",") if x.strip().lstrip("-").isdigit()]
+if not OWNER_IDS:
+    OWNER_IDS = [5393636771]  # <-- agar OWNER_IDS muhit o'zgaruvchisi bo'lmasa, shu yerga o'z ID'ingizni yozing
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id in OWNER_IDS
+
+
+# BAZA ZAXIRASI SAQLANADIGAN GURUH (Render kabi platformalarda doimiy fayl
+# xotirasi bo'lmagani uchun ZARUR - aks holda qayta deploy qilinganda barcha
+# ma'lumot yo'qolib ketadi). Guruh yaratib, botni admin qilib qo'shing
+# (Pin Messages huquqi bilan), so'ng guruh ID'sini shu yerga (yoki Render
+# "Environment" bo'limida STORAGE_CHAT_ID nomi bilan) yozing.
+_storage_chat_id_raw = os.getenv("STORAGE_CHAT_ID", "").strip()
+STORAGE_CHAT_ID = int(_storage_chat_id_raw) if _storage_chat_id_raw.lstrip("-").isdigit() else None
 CHECK_INTERVAL_SECONDS = 60  # muddati tugaganlarni necha soniyada tekshirish
+
+# Botning ASOSIY EGASI (admin panel - /admin - faqat shu ID(lar)ga ochiq).
+# Render "Environment" bo'limida ADMIN_IDS="123456789,987654321" (vergul
+# bilan, bir nechta bo'lishi mumkin) sifatida bering.
+_admin_ids_raw = os.getenv("ADMIN_IDS", "").strip()
+ADMIN_IDS = [int(x) for x in _admin_ids_raw.split(",") if x.strip().lstrip("-").isdigit()]
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 PROXY_URL = (
     os.getenv("BOT_PROXY")
@@ -166,6 +209,11 @@ class BalanceEditFSM(StatesGroup):
     entering_amount = State()
 
 
+class DbUploadFSM(StatesGroup):
+    waiting_file = State()
+    confirming = State()
+
+
 # ==================== MA'LUMOTLAR BAZASI ====================
 
 def db_init():
@@ -201,6 +249,12 @@ def db_init():
             admin_id INTEGER,
             balance INTEGER DEFAULT 0,
             created_at INTEGER
+        )"""
+    )
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
         )"""
     )
     con.commit()
@@ -1140,6 +1194,207 @@ async def cancel_cb(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# ==================== /admin PANELI (BAZA BOSHQARUVI) ====================
+
+def admin_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Hozir zaxiralash / tekshirish", callback_data="adm:backupnow")],
+        [InlineKeyboardButton(text="♻️ Zaxiradan hozir tiklash", callback_data="adm:restorenow")],
+        [InlineKeyboardButton(text="📥 DB faylni qo'lda yuklash", callback_data="adm:dbupload")],
+    ])
+
+
+_BACKUP_REASON_LABELS = {
+    "success": "Muvaffaqiyatli yuklandi",
+    "no_chat": "Saqlash chati topilmadi (STORAGE_CHAT_ID sozlanmagan)",
+    "no_file": "Mahalliy baza fayli topilmadi",
+    "empty_skip": "Baza bo'sh - xavfsizlik uchun o'tkazib yuborildi (eski zaxira saqlanib qoldi)",
+    "upload_failed": "Yuklashda xatolik yuz berdi",
+}
+
+_RESTORE_REASON_LABELS = {
+    "success": "Muvaffaqiyatli tiklandi",
+    "no_chat": "Saqlash chati topilmadi (STORAGE_CHAT_ID sozlanmagan)",
+    "get_chat_failed": "Saqlash chatini olib bo'lmadi",
+    "no_pinned": "PIN qilingan zaxira topilmadi",
+    "download_failed": "Zaxirani yuklab olishda xatolik",
+    "invalid_file": "Yuklab olingan fayl noto'g'ri/buzilgan",
+}
+
+
+@router.message(Command("admin"))
+async def admin_command(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔️ Sizda admin panelidan foydalanish huquqi yo'q.")
+        return
+    await message.answer("⚙️ Admin panel:", reply_markup=admin_menu_kb())
+
+
+@router.callback_query(F.data == "adm:menu")
+async def adm_menu_cb(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await state.clear()
+    await callback.message.edit_text("⚙️ Admin panel:", reply_markup=admin_menu_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:backupnow")
+async def adm_backupnow_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await callback.message.edit_text("🔄 Zaxiralanmoqda, biroz kuting...")
+    result = await backup_database()
+
+    lines = ["🔄 Zaxiralash natijasi:\n"]
+    lines.append(f"Holat: {'✅ Muvaffaqiyatli' if result['ok'] else '❌ Muvaffaqiyatsiz'}")
+    lines.append(f"Sabab: {_BACKUP_REASON_LABELS.get(result['reason'], result['reason'])}")
+    lines.append(f"Obuna yozuvlari soni (mahalliy bazada): {result['access_count']}")
+    lines.append(f"Saqlash chati ID: {result['chat_id']}")
+    if result["ok"]:
+        pin_text = "✅ Ha" if result["pinned"] else "❌ Yo'q (MUAMMO - tiklash ishlamaydi!)"
+        lines.append(f"PIN qilindi: {pin_text}")
+    if result.get("error"):
+        lines.append(f"\n⚠️ Texnik tafsilot:\n{result['error']}")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Orqaga", callback_data="adm:menu")]])
+    await callback.message.edit_text("\n".join(lines), reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:restorenow")
+async def adm_restorenow_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await callback.message.edit_text("♻️ Tiklanmoqda, biroz kuting...")
+    result = await _restore_from_pinned_backup()
+
+    lines = ["♻️ Tiklash natijasi:\n"]
+    lines.append(f"Holat: {'✅ Muvaffaqiyatli' if result['ok'] else '❌ Muvaffaqiyatsiz'}")
+    lines.append(f"Sabab: {_RESTORE_REASON_LABELS.get(result['reason'], result['reason'])}")
+    if result.get("access_count") is not None:
+        lines.append(f"Topilgan obuna yozuvlari soni: {result['access_count']}")
+    if result.get("error"):
+        lines.append(f"\n⚠️ Texnik tafsilot:\n{result['error']}")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Orqaga", callback_data="adm:menu")]])
+    await callback.message.edit_text("\n".join(lines), reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:dbupload")
+async def adm_dbupload_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await state.set_state(DbUploadFSM.waiting_file)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✖️ Bekor qilish", callback_data="adm:dbuploadcancel")]
+    ])
+    await callback.message.edit_text(
+        "📥 Bazani qo'lda yuklash\n\n"
+        "Iltimos, .db faylni HUJJAT sifatida yuboring (masalan, guruhdagi "
+        "pin qilingan zaxirani qayta yuklab, shu yerga jo'nating).",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@router.message(DbUploadFSM.waiting_file, F.document)
+async def adm_dbupload_receive(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    tmp_path = DB_PATH + ".upload_tmp"
+    try:
+        file = await bot.get_file(message.document.file_id)
+        await bot.download_file(file.file_path, destination=tmp_path)
+    except Exception as e:
+        await message.answer(
+            f"❌ Faylni yuklab olishda xatolik: {e}\n\nQaytadan urinib ko'ring, yoki /cancel yozing."
+        )
+        return
+
+    ok, err = _validate_backup_file(tmp_path)
+    if not ok:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        await message.answer(
+            f"❌ Bu fayl to'g'ri baza emasga o'xshaydi ({err}).\n\n"
+            "Boshqa faylni yuboring, yoki /cancel bilan bekor qiling."
+        )
+        return
+
+    con = sqlite3.connect(tmp_path)
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM access")
+    found_count = cur.fetchone()[0]
+    con.close()
+
+    await state.update_data(tmp_path=tmp_path)
+    await state.set_state(DbUploadFSM.confirming)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Ha, almashtirish", callback_data="adm:dbuploadconfirm")],
+        [InlineKeyboardButton(text="❌ Yo'q, bekor qilish", callback_data="adm:dbuploadcancel")],
+    ])
+    await message.answer(
+        f"📄 Fayl tekshirildi.\nTopilgan obuna yozuvlari soni: {found_count}\n\n"
+        "⚠️ Joriy bazangiz shu fayl bilan BUTUNLAY ALMASHTIRILADI. Davom etasizmi?",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(DbUploadFSM.confirming, F.data == "adm:dbuploadconfirm")
+async def adm_dbupload_confirm(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    tmp_path = data.get("tmp_path")
+    await state.clear()
+
+    if not tmp_path or not os.path.exists(tmp_path):
+        await callback.message.edit_text("⚠️ Fayl topilmadi. /admin orqali qaytadan boshlang.")
+        await callback.answer()
+        return
+
+    os.replace(tmp_path, DB_PATH)
+    db_init()
+    access_count = _count_access_rows()
+
+    await callback.message.edit_text(
+        f"✅ Baza muvaffaqiyatli almashtirildi!\nTopilgan obuna yozuvlari soni: {access_count}\n\n"
+        "Tavsiya: endi shu yangi bazani darhol zaxiralab qo'ying - /admin → "
+        "🔄 Hozir zaxiralash / tekshirish tugmasini bosing."
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:dbuploadcancel")
+async def adm_dbupload_cancel(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    tmp_path = data.get("tmp_path")
+    if tmp_path:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+    await state.clear()
+    try:
+        await callback.message.edit_text("Bekor qilindi.")
+    except TelegramBadRequest:
+        pass
+    await callback.message.answer("Asosiy menyu:", reply_markup=MAIN_MENU)
+    await callback.answer()
+
+
 # ==================== KANALGA SO'ROV KELGANDA ====================
 
 @router.chat_join_request()
@@ -1267,10 +1522,247 @@ def start_health_check_server():
     thread.start()
 
 
-async def main():
+def _get_setting(key: str, default=None):
+    """Sozlamani o'qiydi. Jadval hali mavjud bo'lmasa ham xatoga uchramaydi."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = cur.fetchone()
+        con.close()
+    except sqlite3.OperationalError:
+        row = None
+    return row[0] if row else default
+
+
+def _set_setting(key: str, value: str):
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    con.commit()
+    con.close()
+
+
+def _count_access_rows() -> int:
+    """Mahalliy bazadagi 'access' (obuna) yozuvlari sonini hisoblaydi
+    (xavfsizlik tekshiruvi uchun - bo'sh bazani zaxira ustidan yozib
+    yubormaslik uchun)."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("SELECT COUNT(*) FROM access")
+        count = cur.fetchone()[0]
+        con.close()
+        return count
+    except Exception:
+        return 0
+
+
+async def backup_database() -> dict:
+    """
+    kicker.db faylini hujjat sifatida saqlash guruhiga yuklaydi va PIN
+    qiladi. Har safar yangi zaxira muvaffaqiyatli yuklanganidan KEYIN,
+    undan OLDINGI zaxira xabari avtomatik o'chiriladi - shunda guruhda
+    doim faqat BITTA (eng so'nggi) zaxira fayli saqlanadi.
+
+    ⚠️ Agar mahalliy baza BO'SH (0 ta obuna yozuvi) bo'lsa-yu, oldin zaxira
+    mavjud bo'lsa - bu zaxiralanmaydi (yaxshi zaxira yo'q qilib yuborilishining
+    oldini olish uchun).
+
+    Natija lug'ati /admin paneldagi "Hozir zaxiralash" tugmasi uchun
+    to'liq diagnostika ko'rsatishga xizmat qiladi.
+    """
+    global STORAGE_CHAT_ID
+
+    if not STORAGE_CHAT_ID:
+        logger.warning("STORAGE_CHAT_ID sozlanmagan - baza zaxiralanmaydi.")
+        return {"ok": False, "reason": "no_chat", "pinned": False, "access_count": 0, "chat_id": None, "error": None}
+
+    if not os.path.exists(DB_PATH):
+        return {"ok": False, "reason": "no_file", "pinned": False, "access_count": 0, "chat_id": STORAGE_CHAT_ID, "error": None}
+
+    previous_backup_message_id = _get_setting("last_backup_message_id")
+    access_count = _count_access_rows()
+
+    if access_count == 0 and previous_backup_message_id:
+        logger.warning(
+            "⚠️ Mahalliy baza BO'SH ko'rinadi, lekin oldin zaxira mavjud - "
+            "xavfsizlik uchun zaxiralash o'tkazib yuborildi."
+        )
+        return {
+            "ok": False, "reason": "empty_skip", "pinned": False,
+            "access_count": access_count, "chat_id": STORAGE_CHAT_ID, "error": None,
+        }
+
+    sent = None
+    last_error = None
+    attempts_left = 2
+    attempt = 0
+    while attempt < attempts_left and sent is None:
+        try:
+            sent = await bot.send_document(
+                chat_id=STORAGE_CHAT_ID,
+                document=FSInputFile(DB_PATH, filename="kicker_backup.db"),
+                caption="🗄 Avtomatik zaxira nusxa (backup) - bu xabarni O'CHIRMANG.",
+            )
+        except TelegramMigrateToChat as e:
+            new_id = e.migrate_to_chat_id
+            if new_id:
+                logger.warning("Guruh supergroup'ga aylangan. Yangi ID: %s", new_id)
+                STORAGE_CHAT_ID = new_id
+                _set_setting("storage_chat_id", str(new_id))
+                attempts_left += 1
+            last_error = e
+            attempt += 1
+        except Exception as e:
+            logger.exception("Bazani zaxiralashda xatolik yuz berdi.")
+            last_error = e
+            attempt += 1
+
+    if sent is None:
+        return {
+            "ok": False, "reason": "upload_failed", "pinned": False,
+            "access_count": access_count, "chat_id": STORAGE_CHAT_ID,
+            "error": str(last_error) if last_error else None,
+        }
+
+    pinned_ok = True
+    try:
+        await bot.pin_chat_message(chat_id=STORAGE_CHAT_ID, message_id=sent.message_id, disable_notification=True)
+    except Exception:
+        pinned_ok = False
+        logger.warning(
+            "Zaxira xabarini PIN qilib bo'lmadi - botda 'Pin messages' huquqi "
+            "borligini tekshiring (aks holda tiklash ishlamaydi)."
+        )
+
+    _set_setting("last_backup_message_id", str(sent.message_id))
+
+    if previous_backup_message_id:
+        try:
+            await bot.delete_message(chat_id=STORAGE_CHAT_ID, message_id=int(previous_backup_message_id))
+        except Exception:
+            pass  # allaqachon o'chirilgan yoki topilmagan bo'lishi mumkin
+
+    return {
+        "ok": True, "reason": "success", "pinned": pinned_ok,
+        "access_count": access_count, "chat_id": STORAGE_CHAT_ID, "error": None,
+    }
+
+
+def _validate_backup_file(path: str):
+    """
+    Berilgan fayl haqiqatan ham to'g'ri SQLite baza ekanligini va kerakli
+    jadvallar (access, channels) mavjudligini tekshiradi. Qaytaradi:
+    (ok: bool, error_message: str yoki None)
+    """
+    try:
+        con = sqlite3.connect(path)
+        cur = con.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = {row[0] for row in cur.fetchall()}
+        con.close()
+    except Exception as e:
+        return False, str(e)
+
+    if "access" not in tables or "channels" not in tables:
+        return False, "kerakli jadvallar (access, channels) topilmadi"
+
+    return True, None
+
+
+async def _restore_from_pinned_backup() -> dict:
+    """
+    Saqlash guruhida PIN qilingan eng so'nggi zaxirani qidirib, topilsa
+    yuklab, mahalliy faylni ALMASHTIRADI (mavjud fayl bo'lsa ham). Bu
+    funksiya HAM bot ishga tushganda (restore_database_if_needed orqali,
+    faqat mahalliy fayl bo'sh/yo'q bo'lsagina), HAM /admin paneldagi
+    "Zaxiradan hozir tiklash" tugmasi orqali (har doim, majburiy) chaqiriladi.
+    """
+    if not STORAGE_CHAT_ID:
+        return {"ok": False, "reason": "no_chat"}
+
+    try:
+        chat = await bot.get_chat(STORAGE_CHAT_ID)
+    except Exception as e:
+        logger.exception("Saqlash chatini olishda xatolik.")
+        return {"ok": False, "reason": "get_chat_failed", "error": str(e)}
+
+    pinned = chat.pinned_message
+    if pinned is None or pinned.document is None:
+        return {"ok": False, "reason": "no_pinned"}
+
+    try:
+        file = await bot.get_file(pinned.document.file_id)
+        tmp_path = DB_PATH + ".restore_tmp"
+        await bot.download_file(file.file_path, destination=tmp_path)
+    except Exception as e:
+        logger.exception("Zaxirani yuklab olishda xatolik.")
+        return {"ok": False, "reason": "download_failed", "error": str(e)}
+
+    # Yuklab olingan faylni tekshiramiz (haqiqatan ham to'g'ri baza ekanligini)
+    ok, err = _validate_backup_file(tmp_path)
+    if not ok:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return {"ok": False, "reason": "invalid_file", "error": err}
+
+    os.replace(tmp_path, DB_PATH)
     db_init()
+    access_count = _count_access_rows()
+    logger.info("✅ Baza muvaffaqiyatli zaxiradan tiklandi (%s).", DB_PATH)
+    return {"ok": True, "reason": "success", "access_count": access_count}
+
+
+async def restore_database_if_needed():
+    """
+    Bot ishga tushganda (main() ichida) chaqiriladi. FAQAT mahalliy baza
+    fayli MAVJUD BO'LMASA yoki BO'SH bo'lsa, saqlash guruhida PIN qilingan
+    eng so'nggi zaxiradan tiklaydi (_restore_from_pinned_backup orqali).
+    Agar mahalliy fayl allaqachon bor va bo'sh bo'lmasa - tegilmaydi.
+    """
+    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
+        return
+
+    if not STORAGE_CHAT_ID:
+        logger.info("STORAGE_CHAT_ID sozlanmagan - yangi (bo'sh) baza bilan boshlanadi.")
+        return
+
+    result = await _restore_from_pinned_backup()
+    if result.get("ok"):
+        logger.info(
+            "✅ Baza muvaffaqiyatli zaxiradan tiklandi (%s ta obuna yozuvi).",
+            result.get("access_count"),
+        )
+    else:
+        logger.info(
+            "Zaxiradan tiklab bo'lmadi (sabab: %s) - yangi (bo'sh) baza bilan boshlanadi.",
+            result.get("reason"),
+        )
+
+
+async def backup_loop():
+    """Har 1 soatda bir marta avtomatik zaxiralab turadigan fon vazifasi."""
+    await asyncio.sleep(60)  # birinchi zaxira 1 daqiqadan keyin
+    while True:
+        try:
+            await backup_database()
+        except Exception:
+            logger.exception("backup_loop ichida kutilmagan xatolik.")
+        await asyncio.sleep(3600)  # keyingi zaxiralar - har soatda
+
+
+async def main():
+    await restore_database_if_needed()  # avval - mahalliy baza yo'q/bo'sh bo'lsa, zaxiradan tiklaydi
+    db_init()  # keyin - jadvallarni yaratadi/migratsiya qiladi (tiklangan yoki yangi fayl ustida)
     start_health_check_server()
     asyncio.create_task(check_expired_members())
+    asyncio.create_task(backup_loop())  # har soatda avtomatik zaxiralab turadi
     logger.info("Bot ishga tushdi...")
     await dp.start_polling(bot)
 
