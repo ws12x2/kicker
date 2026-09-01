@@ -1,0 +1,16 @@
+# Ma'lumotlar bazasi fayli GIT'DA SAQLANMASLIGI KERAK - u faqat bot
+# ishlayotganda yaratiladi/yangilanadi va Telegram orqali (baza guruhiga)
+# zaxiralanadi (kicker.py ichidagi backup_database/restore_database_if_needed
+# funksiyalari). Agar bu fayl git'da qolib ketsa, har safar qayta deploy
+# qilinganda ESKIRGAN holat qaytarib qo'yiladi va yangi ma'lumotlar yo'qoladi.
+kicker.db
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
